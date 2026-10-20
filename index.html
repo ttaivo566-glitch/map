@@ -153,6 +153,7 @@ body.picking .leaflet-container{cursor:crosshair}
       <summary>Dữ liệu và công cụ</summary>
       <div class="rowb"><button id="bCalc">Tính lại lộ trình</button><button id="bExport">Xuất file</button><button id="bImport">Nhập file</button></div>
       <div class="rowb"><button id="bReset">Bắt đầu ngày mới (đặt lại trạng thái)</button></div>
+      <label style="display:flex;gap:8px;align-items:flex-start;color:var(--ink);font-size:14px;margin-top:12px"><input type="checkbox" id="manualArr" style="width:auto;margin-top:3px"><span>Cho phép bấm “Đã đến” thủ công (dùng khi GPS yếu hoặc ghim lệch quá 10 m)</span></label>
       <input type="file" id="fileIn" accept=".json" hidden>
     </details>
   </div>
@@ -194,14 +195,15 @@ body.picking .leaflet-container{cursor:crosshair}
 
 <script>
 (function(){
-var KEY='lotrinh_tham_kham_v1', ARRIVE_M=60, ASK_GAP=5*60*1000;
+var KEY='lotrinh_tham_kham_v1', ARRIVE_M=10, ASK_GAP=5*60*1000;
 var S=load(), me=null, accuracy=null, watchId=null, wl=null;
 var draft=null, editId=null, pick=null;
 var etas={}, lastCalc={t:0,pos:null}, routeLine=null, tmpMarker=null, markers={}, meMarker=null, bannerFor=null, centeredOnMe=false;
 var $=function(i){return document.getElementById(i)};
 
 function load(){try{var d=JSON.parse(localStorage.getItem(KEY));if(d&&d.patients)return d}catch(e){}return{patients:[]}}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}}
+function strip(k,v){return k.charAt(0)==='_'?undefined:v}
+function save(){try{localStorage.setItem(KEY,JSON.stringify(S,strip))}catch(e){}}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function toast(t){var e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(toast.t);toast.t=setTimeout(function(){e.style.display='none'},3600)}
 function pending(){return S.patients.filter(function(p){return p.status!=='done'})}
@@ -209,7 +211,7 @@ function fmtT(d){return d.toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-d
 function fmtDur(s){var m=Math.max(1,Math.round(s/60));if(m<60)return m+' phút';return Math.floor(m/60)+' giờ'+(m%60?' '+m%60+' phút':'')}
 function fmtDist(d){return d<1000?Math.round(d)+' m':(d/1000).toFixed(1)+' km'}
 function hav(a,b){var R=6371000,r=Math.PI/180,dl=(b.lat-a.lat)*r,dg=(b.lng-a.lng)*r;var x=Math.sin(dl/2)*Math.sin(dl/2)+Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin(dg/2)*Math.sin(dg/2);return 2*R*Math.asin(Math.sqrt(x))}
-function radius(){return Math.max(ARRIVE_M,Math.min(accuracy||0,100))}
+function radius(){return ARRIVE_M}
 function copyText(t){
   if(navigator.clipboard&&navigator.clipboard.writeText)return navigator.clipboard.writeText(t).then(function(){toast('Đã sao chép link')}).catch(fb);
   fb();
@@ -267,12 +269,17 @@ function centerOn(lat,lng,zoom){
   var b=bottomInset();if(b)map.panBy([0,b/2],{animate:false});
 }
 function numIcon(n,cls){return L.divIcon({className:'',html:'<div class="pin '+(cls||'')+'"><span>'+n+'</span></div>',iconSize:[28,28],iconAnchor:[14,28]})}
+function popupHtml(p){return '<b>'+esc(p.name)+'</b><br>'+esc(p.addr||p._rev||(p._rev===undefined?'Đang tìm địa chỉ…':''))+(p.phone?'<br>'+esc(p.phone):'')+'<br><small>'+p.lat.toFixed(5)+', '+p.lng.toFixed(5)+'</small>'}
 function drawMarkers(){
   Object.keys(markers).forEach(function(k){map.removeLayer(markers[k])});markers={};
   S.patients.forEach(function(p,i){
     var d=p.status==='done';
     var m=L.marker([p.lat,p.lng],{icon:numIcon(d?'✓':i+1,d?'done':'')}).addTo(map);
-    m.bindPopup('<b>'+esc(p.name)+'</b><br>'+esc(p.addr||'')+(p.phone?'<br>'+esc(p.phone):''));
+    m.bindPopup(popupHtml(p));
+    m.on('popupopen',function(){
+      if(p.addr||p._rev!==undefined)return;
+      reverse(p.lat,p.lng).then(function(a){p._rev=a||'';m.setPopupContent(popupHtml(p))});
+    });
     m.on('click',function(){
       if(isMobile()&&sheetState==='peek')setSheet('half');
       var c=document.querySelector('.card[data-id="'+p.id+'"]');if(c)c.scrollIntoView({block:'center',behavior:'smooth'})
@@ -307,27 +314,52 @@ function startPick(cand){
   pick={cand:null};
   hideForm();document.body.classList.add('picking');$('pickbar').classList.add('show');
   if(tmpMarker){map.removeLayer(tmpMarker);tmpMarker=null}
-  if(cand)setCand(cand.lat,cand.lng,cand.label,true);
+  if(cand)setCand(cand.lat,cand.lng,cand.label,true,cand.addr);
   else{updatePickBar();if(me)centerOn(me.lat,me.lng,16)}
 }
-function setCand(lat,lng,label,center){
-  pick.cand={lat:lat,lng:lng,label:label};
+var revCache={},revTok=0;
+function reverse(lat,lng){
+  var k=lat.toFixed(5)+','+lng.toFixed(5);
+  if(revCache[k]!==undefined)return Promise.resolve(revCache[k]);
+  return fetch('https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&zoom=18&accept-language=vi&lat='+lat+'&lon='+lng)
+   .then(function(r){return r.json()}).then(function(d){
+     if(!d||d.error)return '';
+     var a=d.address||{},road=a.road||a.pedestrian||a.footway||'';
+     var parts=[[a.house_number,road].filter(Boolean).join(' '),a.quarter||a.suburb||a.neighbourhood||a.village||'',a.city_district||a.county||a.district||'',a.city||a.town||a.state||''].filter(Boolean);
+     var r2=parts.length?parts.join(', '):(d.display_name||'');
+     revCache[k]=r2;return r2;
+   }).catch(function(){return ''});
+}
+function setCand(lat,lng,label,center,addr){
+  pick.cand={lat:lat,lng:lng,label:label,addr:addr};
   if(tmpMarker)map.removeLayer(tmpMarker);
   tmpMarker=L.marker([lat,lng],{icon:numIcon('+','tmp'),draggable:true}).addTo(map);
+  tmpMarker.bindPopup(function(){var c=pick&&pick.cand;return c?'<b>'+esc(c.addr===undefined?'Đang tìm địa chỉ…':(c.addr||c.label))+'</b><br><small>'+c.lat.toFixed(5)+', '+c.lng.toFixed(5)+'</small>':''});
   tmpMarker.on('dragend',function(){var p=tmpMarker.getLatLng();setCand(p.lat,p.lng,'Vị trí đã kéo chỉnh',false)});
   if(center)centerOn(lat,lng,Math.max(map.getZoom(),17));
   updatePickBar();
+  var tok=++revTok;
+  if(addr===undefined){
+    reverse(lat,lng).then(function(a){
+      if(tok!==revTok||!pick||!pick.cand)return;
+      pick.cand.addr=a;updatePickBar();
+      try{if(tmpMarker&&tmpMarker.isPopupOpen())tmpMarker.getPopup().update()}catch(e){}
+    });
+  }
 }
 function updatePickBar(){
-  $('pkText').textContent=pick&&pick.cand?pick.cand.label:'Chạm vào bản đồ để ghim vị trí';
-  $('pkSub').textContent=pick&&pick.cand?'Chạm bản đồ hoặc kéo ghim để chỉnh cho đúng nhà, rồi bấm "Dùng vị trí này".':'Phóng to bản đồ để ghim chính xác hơn.';
-  $('pkOk').disabled=!(pick&&pick.cand);
+  var c=pick&&pick.cand;
+  $('pkText').textContent=c?(c.addr===undefined?'Đang tìm địa chỉ…':(c.addr||c.label)):'Chạm vào bản đồ để ghim vị trí';
+  $('pkSub').textContent=c?(c.lat.toFixed(5)+', '+c.lng.toFixed(5)+' · Chạm bản đồ hoặc kéo ghim để chỉnh. Địa chỉ lấy từ OpenStreetMap, hẻm nhỏ có thể chỉ hiện tên đường hoặc phường.'):'Phóng to bản đồ để ghim chính xác hơn.';
+  $('pkOk').disabled=!c;
 }
 function endPick(){pick=null;document.body.classList.remove('picking');$('pickbar').classList.remove('show');syncDraftMarker()}
 map.on('click',function(e){if(pick)setCand(e.latlng.lat,e.latlng.lng,'Vị trí đã chọn trên bản đồ',false)});
 $('pkOk').onclick=function(){
   if(!pick||!pick.cand)return;
-  var c=pick.cand;setDraft(c.lat,c.lng,c.label.length>70?c.label.slice(0,70)+'…':c.label);
+  var c=pick.cand,txt=c.addr||c.label;
+  setDraft(c.lat,c.lng,txt.length>70?txt.slice(0,70)+'…':txt);
+  if(!$('fAddr').value.trim()&&c.addr)$('fAddr').value=c.addr;
   endPick();showForm();
 };
 $('pkCancel').onclick=function(){endPick();showForm()};
@@ -343,7 +375,7 @@ function geocode(){
      a.forEach(function(x){
        var d=document.createElement('div');
        d.innerHTML=esc(x.display_name)+'<small>Chạm để xem trên bản đồ ›</small>';
-       d.onclick=function(){startPick({lat:+x.lat,lng:+x.lon,label:x.display_name})};
+       d.onclick=function(){startPick({lat:+x.lat,lng:+x.lon,label:x.display_name,addr:x.display_name})};
        box.appendChild(d);
      });
    }).catch(function(){box.innerHTML='<div>Không tìm được (mất mạng?). Hãy ghim trên bản đồ.</div>'});
@@ -391,6 +423,7 @@ function moveToNext(id){
 }
 function markArrived(id){
   var p=S.patients.filter(function(x){return x.id===id})[0];if(!p||p.status==='done')return;
+  if(!S.manualArrive&&!(me&&hav(me,p)<=ARRIVE_M)){toast('Cần đến trong phạm vi '+ARRIVE_M+' m của điểm này mới xác nhận được');return}
   p.status='done';p.arrivedAt=Date.now();
   hideBanner();
   if(!me||hav(me,p)>300){me={lat:p.lat,lng:p.lng};drawMe()}
@@ -460,6 +493,7 @@ function renderSummary(s){
   $('mini').textContent='Còn '+s.n+' điểm · '+(s.dist/1000).toFixed(1)+' km · '+fmtDur(s.move);
 }
 function moveToNextLabel(){return '⇧ Thăm trước'}
+function arrBtn(id){return '<button class="arr" data-act="arr" data-id="'+id+'"'+(S.manualArrive?'':' disabled')+'>✔ Đã đến</button>'}
 function renderList(){
   var nextId=(pending()[0]||{}).id,h='';
   S.patients.forEach(function(p,i){
@@ -472,7 +506,7 @@ function renderList(){
       }else{
         var fromMe=id===nextId&&me&&prev.status==='done';
         h+='<div class="lmeta">'+(e&&e.legD?'🛵 '+fmtDist(e.legD)+' · '+fmtDur(e.leg)+(fromMe?' (từ vị trí hiện tại)':''):'')+'</div>'
-         +'<div class="acts"><button class="gm" data-act="route" data-id="'+id+'">🧭 Đường đi</button><button class="arr" data-act="arr" data-id="'+id+'">✔ Đã đến</button></div>';
+         +'<div class="acts"><button class="gm" data-act="route" data-id="'+id+'">🧭 Đường đi</button>'+arrBtn(id)+'</div>';
       }
       h+='</div>';
     }
@@ -484,7 +518,7 @@ function renderList(){
      +(i===0&&dn?'<div class="eta">Đã đến lúc '+(p.arrivedAt?fmtT(new Date(p.arrivedAt)):'')+'</div>':'')
      +'<div class="acts">';
     if(i===0){
-      h+=dn?'<button data-act="undo" data-id="'+id+'">Hoàn tác</button>':'<button class="gm" data-act="route" data-id="'+id+'">🧭 Đường đi</button><button class="arr" data-act="arr" data-id="'+id+'">✔ Đã đến</button>';
+      h+=dn?'<button data-act="undo" data-id="'+id+'">Hoàn tác</button>':'<button class="gm" data-act="route" data-id="'+id+'">🧭 Đường đi</button>'+arrBtn(id)+'';
     }
     if(!dn){
       h+='<button data-act="up" data-id="'+id+'" aria-label="Lên">▲</button><button data-act="dn" data-id="'+id+'" aria-label="Xuống">▼</button>';
@@ -562,16 +596,26 @@ function showBanner(p){
 }
 function hideBanner(){bannerFor=null;$('banner').classList.remove('show')}
 function updateLive(){
-  if(!me)return;
-  var now=Date.now(),R=radius(),best=null,nearIds={};
+  var man=!!S.manualArrive;
+  if(!me){
+    if(!man)document.querySelectorAll('.arr').forEach(function(b){b.disabled=true;b.textContent='Chờ GPS…'});
+    return;
+  }
+  var now=Date.now(),best=null,nearIds={};
   pending().forEach(function(p){
     var d=hav(me,p);p._d=d;
-    var near=d<=R;
+    var near=d<=ARRIVE_M;
     var card=document.querySelector('.card[data-id="'+p.id+'"]');
     if(card){card.querySelector('.dist').textContent='cách '+fmtDist(d);card.classList.toggle('near',near)}
     var leg=document.querySelector('.leg[data-id="'+p.id+'"]');
     if(leg)leg.classList.toggle('near',near);
-    document.querySelectorAll('.arr[data-id="'+p.id+'"]').forEach(function(btn){btn.classList.toggle('lit',near)});
+    document.querySelectorAll('.arr[data-id="'+p.id+'"]').forEach(function(btn){
+      var ok=near||man;
+      btn.classList.toggle('lit',near);
+      btn.disabled=!ok;
+      btn.textContent=ok?'✔ Đã đến':'Còn '+fmtDist(d);
+      btn.title=near?'':'Cần đến trong phạm vi '+ARRIVE_M+' m';
+    });
     if(near){nearIds[p.id]=1;if(!best||d<best._d)best=p}
   });
   if(bannerFor&&!nearIds[bannerFor])hideBanner();
@@ -635,7 +679,7 @@ function checkSharedHash(){
 }
 
 /* ---------- Sao lưu ---------- */
-function exportData(){var blob=new Blob([JSON.stringify(S,null,1)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='lo-trinh-'+new Date().toISOString().slice(0,10)+'.json';a.click()}
+function exportData(){var blob=new Blob([JSON.stringify(S,strip,1)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='lo-trinh-'+new Date().toISOString().slice(0,10)+'.json';a.click()}
 function importData(f){var r=new FileReader();r.onload=function(){try{var d=JSON.parse(r.result);if(!d.patients)throw 0;S=d;save();refresh(true);toast('Đã nhập dữ liệu')}catch(e){toast('File không hợp lệ')}};r.readAsText(f)}
 
 /* ---------- Khởi tạo ---------- */
@@ -651,6 +695,8 @@ $('bHere').onclick=function(){
 };
 $('bPaste').onclick=function(){var c=parseCoords($('fPaste').value);if(c)startPick({lat:c.lat,lng:c.lng,label:'Toạ độ đã dán'});else toast('Không đọc được toạ độ. Dùng dạng 10.7769, 106.7009 hoặc link Google Maps dài')};
 $('bSave').onclick=savePatient;
+$('manualArr').checked=!!S.manualArrive;
+$('manualArr').onchange=function(){S.manualArrive=this.checked;save();renderList()};
 $('bOpt').onclick=optimize;
 $('bShare').onclick=openShare;
 $('bCalc').onclick=function(){calcRoute().then(function(){toast('Đã tính lại')})};
